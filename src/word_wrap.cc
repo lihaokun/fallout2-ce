@@ -31,45 +31,60 @@ int wordWrap(const char* string, int width, short* breakpoints, short* breakpoin
     int gap = fontGetLetterSpacing();
 
     int accum = 0;
-    const char* prevSpaceOrHyphen = nullptr;
+    const char* lineStart = string;
+    const char* previousBreak = nullptr;
     const char* pch = string;
     while (*pch != '\0') {
-        accum += gap + fontGetCharacterWidth(*pch & 0xFF);
-        if (accum <= width) {
+        int characterLength;
+        int ch = fontDecodeCharacter(pch, &characterLength);
+        if (characterLength <= 0) {
+            return -1;
+        }
+
+        int characterWidth = gap + fontGetCharacterWidth(ch);
+        if (accum + characterWidth <= width) {
+            accum += characterWidth;
+
             // NOTE: quests.txt #807 uses extended ascii.
-            if (isspace(*pch & 0xFF) || *pch == '-') {
-                prevSpaceOrHyphen = pch;
+            if (ch <= 0xFF && (isspace(ch) || ch == '-')) {
+                previousBreak = pch + characterLength;
             }
+
+            pch += characterLength;
+            continue;
+        }
+
+        if (*breakpointsLengthPtr == WORD_WRAP_MAX_COUNT) {
+            return -1;
+        }
+
+        const char* nextLine;
+        if (previousBreak != nullptr && previousBreak > lineStart) {
+            nextLine = previousBreak;
         } else {
-            if (*breakpointsLengthPtr == WORD_WRAP_MAX_COUNT) {
+            // The first glyph should have fit because of the monospaced width
+            // check above. Keep this guard to avoid looping on malformed fonts.
+            if (pch == lineStart) {
                 return -1;
             }
 
-            if (prevSpaceOrHyphen != nullptr) {
-                // Word wrap.
-                breakpoints[*breakpointsLengthPtr] = prevSpaceOrHyphen - string + 1;
-                *breakpointsLengthPtr += 1;
-
-                pch = prevSpaceOrHyphen;
-            } else {
-                // Character wrap.
-                breakpoints[*breakpointsLengthPtr] = pch - string;
-                *breakpointsLengthPtr += 1;
-
-                pch--;
-            }
-
-            prevSpaceOrHyphen = nullptr;
-            accum = 0;
+            nextLine = pch;
         }
-        pch++;
+
+        breakpoints[*breakpointsLengthPtr] = nextLine - string;
+        *breakpointsLengthPtr += 1;
+
+        lineStart = nextLine;
+        pch = nextLine;
+        previousBreak = nullptr;
+        accum = 0;
     }
 
     if (*breakpointsLengthPtr == WORD_WRAP_MAX_COUNT) {
         return -1;
     }
 
-    breakpoints[*breakpointsLengthPtr] = pch - string + 1;
+    breakpoints[*breakpointsLengthPtr] = pch - string;
     *breakpointsLengthPtr += 1;
 
     return 0;

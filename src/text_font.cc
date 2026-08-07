@@ -1,5 +1,6 @@
 #include "text_font.h"
 
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
 
@@ -40,6 +41,8 @@ typedef struct TextFontDescriptor {
 
     TextFontGlyph* glyphs;
     unsigned char* data;
+    int dataSize;
+    int maxGlyphWidth;
 } TextFontDescriptor;
 
 static void textFontSetCurrentImpl(int font);
@@ -52,6 +55,12 @@ static int textFontGetMonospacedStringWidthImpl(const char* string);
 static int textFontGetLetterSpacingImpl();
 static int textFontGetBufferSizeImpl(const char* string);
 static int textFontGetMonospacedCharacterWidthImpl();
+static int textFontDecodeCharacterImpl(const char* string, int* length);
+static bool textFontUsesDbcs();
+static bool textFontGetGlyphView(const TextFontDescriptor* fontDescriptor, int ch, TextFontGlyphView* glyphView);
+static bool textFontGetCurrentGlyphView(int ch, TextFontGlyphView* glyphView);
+static int textFontGetScaledGlyphWidth(const TextFontGlyphView& glyphView);
+static void textFontDrawGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
 
 // 0x4D5530 GNW_text_functions
 FontManager gTextFontManager = {
@@ -66,6 +75,7 @@ FontManager gTextFontManager = {
     textFontGetLetterSpacingImpl,
     textFontGetBufferSizeImpl,
     textFontGetMonospacedCharacterWidthImpl,
+    textFontDecodeCharacterImpl,
 };
 
 // 0x51E3B0 curr_font_num
@@ -97,6 +107,8 @@ FontManagerGetBufferSizeProc* fontGetBufferSize = nullptr;
 
 // 0x51E3D4 text_max
 FontManagerGetMonospacedCharacterWidth* fontGetMonospacedCharacterWidth = nullptr;
+
+FontManagerDecodeCharacterProc* fontDecodeCharacter = nullptr;
 
 // 0x6ADB08 font
 static TextFontDescriptor gTextFontDescriptors[TEXT_FONT_MAX];
@@ -153,11 +165,22 @@ void textFontsExit()
 // 0x4D55FC load_font
 int textFontLoad(int font)
 {
+    if (font < 0 || font >= TEXT_FONT_MAX) {
+        return -1;
+    }
+
     int rc = -1;
+    int fileSize = 0;
+    int dataSize = 0;
+    int glyphsPtr = 0;
+    int dataPtr = 0;
+    long long glyphTableSize = 0;
 
     TextFontDescriptor* textFontDescriptor = &(gTextFontDescriptors[font]);
     textFontDescriptor->data = nullptr;
     textFontDescriptor->glyphs = nullptr;
+    textFontDescriptor->dataSize = 0;
+    textFontDescriptor->maxGlyphWidth = 0;
 
     File* stream = nullptr;
     char path[COMPAT_MAX_PATH];
@@ -181,7 +204,10 @@ int textFontLoad(int font)
         }
     }
 
-    int dataSize;
+    fileSize = fileGetSize(stream);
+    if (fileSize < 20) {
+        goto out;
+    }
 
     // NOTE: Original code reads entire descriptor in one go. This does not work
     // in x64 because of the two pointers.
@@ -190,11 +216,23 @@ int textFontLoad(int font)
     if (fileRead(&(textFontDescriptor->lineHeight), 4, 1, stream) != 1) goto out;
     if (fileRead(&(textFontDescriptor->letterSpacing), 4, 1, stream) != 1) goto out;
 
-    int glyphsPtr;
     if (fileRead(&glyphsPtr, 4, 1, stream) != 1) goto out;
 
-    int dataPtr;
     if (fileRead(&dataPtr, 4, 1, stream) != 1) goto out;
+
+    if (textFontDescriptor->glyphCount <= 0
+        || textFontDescriptor->glyphCount > 65536
+        || textFontDescriptor->lineHeight <= 0
+        || textFontDescriptor->lineHeight > 4096
+        || textFontDescriptor->letterSpacing < 0
+        || textFontDescriptor->letterSpacing > 4096) {
+        goto out;
+    }
+
+    glyphTableSize = static_cast<long long>(textFontDescriptor->glyphCount) * sizeof(TextFontGlyph);
+    if (20 + glyphTableSize > fileSize) {
+        goto out;
+    }
 
     textFontDescriptor->glyphs = (TextFontGlyph*)internal_malloc(textFontDescriptor->glyphCount * sizeof(TextFontGlyph));
     if (textFontDescriptor->glyphs == nullptr) {
@@ -205,7 +243,25 @@ int textFontLoad(int font)
         goto out;
     }
 
-    dataSize = textFontDescriptor->lineHeight * ((textFontDescriptor->glyphs[textFontDescriptor->glyphCount - 1].width + 7) >> 3) + textFontDescriptor->glyphs[textFontDescriptor->glyphCount - 1].dataOffset;
+    dataSize = fileSize - 20 - static_cast<int>(glyphTableSize);
+    if (dataSize <= 0) {
+        goto out;
+    }
+
+    for (int index = 0; index < textFontDescriptor->glyphCount; index++) {
+        TextFontGlyph* glyph = &(textFontDescriptor->glyphs[index]);
+        if (glyph->width < 0 || glyph->width > 4096 || glyph->dataOffset < 0) {
+            goto out;
+        }
+
+        long long glyphSize = static_cast<long long>(textFontDescriptor->lineHeight) * ((glyph->width + 7) >> 3);
+        if (glyph->dataOffset + glyphSize > dataSize) {
+            goto out;
+        }
+
+        textFontDescriptor->maxGlyphWidth = std::max(textFontDescriptor->maxGlyphWidth, glyph->width);
+    }
+
     textFontDescriptor->data = (unsigned char*)internal_malloc(dataSize);
     if (textFontDescriptor->data == nullptr) {
         goto out;
@@ -214,6 +270,8 @@ int textFontLoad(int font)
     if (fileRead(textFontDescriptor->data, 1, dataSize, stream) != dataSize) {
         goto out;
     }
+
+    textFontDescriptor->dataSize = dataSize;
 
     rc = 0;
 
@@ -229,6 +287,12 @@ out:
             internal_free(textFontDescriptor->glyphs);
             textFontDescriptor->glyphs = nullptr;
         }
+
+        textFontDescriptor->dataSize = 0;
+        textFontDescriptor->maxGlyphWidth = 0;
+        textFontDescriptor->glyphCount = 0;
+        textFontDescriptor->lineHeight = 0;
+        textFontDescriptor->letterSpacing = 0;
     }
 
     if (stream != nullptr) {
@@ -236,6 +300,93 @@ out:
     }
 
     return rc;
+}
+
+int textFontDecodeDbcsCharacter(const char* string, int* length)
+{
+    if (length != nullptr) {
+        *length = 0;
+    }
+
+    if (string == nullptr || *string == '\0') {
+        return 0;
+    }
+
+    unsigned char lead = static_cast<unsigned char>(string[0]);
+    if (length != nullptr) {
+        *length = 1;
+    }
+
+    if (!textFontUsesDbcs()) {
+        return lead;
+    }
+
+    if (lead < 0x81 || lead > 0xFE || string[1] == '\0') {
+        return lead;
+    }
+
+    unsigned char trail = static_cast<unsigned char>(string[1]);
+    if (trail < 0x40 || trail > 0xFE || trail == 0x7F) {
+        return lead;
+    }
+
+    int ch = (lead << 8) | trail;
+    if (length != nullptr) {
+        *length = 2;
+    }
+
+    return ch;
+}
+
+bool textFontGetDbcsGlyph(int ch, TextFontGlyphView* glyphView)
+{
+    if (ch <= 0xFF) {
+        return false;
+    }
+
+    for (int font = 0; font < TEXT_FONT_MAX; font++) {
+        TextFontDescriptor* fontDescriptor = &(gTextFontDescriptors[font]);
+        if (fontDescriptor->glyphCount <= 256) {
+            continue;
+        }
+
+        TextFontGlyphView view;
+        if (ch < fontDescriptor->glyphCount
+            && textFontGetGlyphView(fontDescriptor, ch, &view)
+            && view.width > 0) {
+            if (glyphView != nullptr) {
+                *glyphView = view;
+            }
+            return true;
+        }
+
+        // The supplied CJK bitmap fonts commonly leave the full-width space
+        // empty. It still needs a full glyph advance to keep layout intact.
+        if (ch == 0xA1A1) {
+            if (glyphView != nullptr) {
+                glyphView->width = fontDescriptor->lineHeight;
+                glyphView->height = fontDescriptor->lineHeight;
+                glyphView->rowBytes = 0;
+                glyphView->data = nullptr;
+            }
+            return true;
+        }
+
+        // Some community fonts omit a handful of valid code points. Keep the
+        // byte stream synchronized and use readable in-font fallbacks instead
+        // of splitting the pair into two extended-ASCII characters.
+        int fallback = ch == 0xA1A2 ? 0xA3AC : 0xA1F5;
+        if (fallback < fontDescriptor->glyphCount
+            && textFontGetGlyphView(fontDescriptor, fallback, &view)
+            && view.width > 0) {
+            if (glyphView != nullptr) {
+                *glyphView = view;
+            }
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // 0x4D5780 text_add_manager
@@ -298,6 +449,7 @@ void fontSetCurrent(int font)
         fontGetLetterSpacing = fontManager->getLetterSpacingProc;
         fontGetBufferSize = fontManager->getBufferSizeProc;
         fontGetMonospacedCharacterWidth = fontManager->getMonospacedCharacterWidthProc;
+        fontDecodeCharacter = fontManager->decodeCharacterProc;
 
         gCurrentFont = font;
 
@@ -319,6 +471,84 @@ static bool fontManagerFind(int font, FontManager** fontManagerPtr)
     return false;
 }
 
+static bool textFontGetGlyphView(const TextFontDescriptor* fontDescriptor, int ch, TextFontGlyphView* glyphView)
+{
+    if (fontDescriptor == nullptr
+        || fontDescriptor->data == nullptr
+        || ch < 0
+        || ch >= fontDescriptor->glyphCount) {
+        return false;
+    }
+
+    const TextFontGlyph* glyph = &(fontDescriptor->glyphs[ch]);
+    int rowBytes = (glyph->width + 7) >> 3;
+    long long glyphEnd = static_cast<long long>(glyph->dataOffset) + static_cast<long long>(rowBytes) * fontDescriptor->lineHeight;
+    if (glyph->dataOffset < 0 || glyphEnd > fontDescriptor->dataSize) {
+        return false;
+    }
+
+    if (glyphView != nullptr) {
+        glyphView->width = glyph->width;
+        glyphView->height = fontDescriptor->lineHeight;
+        glyphView->rowBytes = rowBytes;
+        glyphView->data = fontDescriptor->data + glyph->dataOffset;
+    }
+
+    return true;
+}
+
+static bool textFontUsesDbcs()
+{
+    return compat_stricmp(settings.system.language.c_str(), "chs") == 0;
+}
+
+static bool textFontGetCurrentGlyphView(int ch, TextFontGlyphView* glyphView)
+{
+    TextFontGlyphView view;
+    if (textFontGetGlyphView(gCurrentTextFontDescriptor, ch, &view)
+        && (ch <= 0xFF || view.width > 0)) {
+        if (glyphView != nullptr) {
+            *glyphView = view;
+        }
+        return true;
+    }
+
+    return textFontGetDbcsGlyph(ch, glyphView);
+}
+
+static int textFontGetScaledGlyphWidth(const TextFontGlyphView& glyphView)
+{
+    if (glyphView.width <= 0 || glyphView.height <= 0) {
+        return 0;
+    }
+
+    return std::max(1, (glyphView.width * gCurrentTextFontDescriptor->lineHeight + glyphView.height / 2) / glyphView.height);
+}
+
+static void textFontDrawGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
+{
+    if (glyphView.data == nullptr
+        || glyphView.width <= 0
+        || glyphView.height <= 0
+        || targetWidth <= 0
+        || targetHeight <= 0) {
+        return;
+    }
+
+    for (int y = 0; y < targetHeight; y++) {
+        int sourceY = y * glyphView.height / targetHeight;
+        const unsigned char* sourceRow = glyphView.data + sourceY * glyphView.rowBytes;
+        unsigned char* destination = buf + y * pitch;
+
+        for (int x = 0; x < targetWidth; x++) {
+            int sourceX = x * glyphView.width / targetWidth;
+            if ((sourceRow[sourceX >> 3] & (0x80 >> (sourceX & 7))) != 0) {
+                destination[x] = color & 0xFF;
+            }
+        }
+    }
+}
+
 // 0x4D59B0 GNW_text_to_buf
 static void textFontDrawImpl(unsigned char* buf, const char* string, int length, int pitch, int color)
 {
@@ -334,44 +564,39 @@ static void textFontDrawImpl(unsigned char* buf, const char* string, int length,
 
     unsigned char* ptr = buf;
     while (*string != '\0') {
-        char ch = *string++;
-        if (ch < gCurrentTextFontDescriptor->glyphCount) {
-            TextFontGlyph* glyph = &(gCurrentTextFontDescriptor->glyphs[ch & 0xFF]);
-
-            unsigned char* end;
-            if ((color & DRAW_TEXT_FLAG_MONOSPACED) != 0) {
-                end = ptr + monospacedCharacterWidth;
-                ptr += (monospacedCharacterWidth - gCurrentTextFontDescriptor->letterSpacing - glyph->width) / 2;
-            } else {
-                end = ptr + glyph->width + gCurrentTextFontDescriptor->letterSpacing;
-            }
-
-            if (end - buf > length) {
-                break;
-            }
-
-            unsigned char* glyphData = gCurrentTextFontDescriptor->data + glyph->dataOffset;
-            for (int y = 0; y < gCurrentTextFontDescriptor->lineHeight; y++) {
-                int bits = 0x80;
-                for (int x = 0; x < glyph->width; x++) {
-                    if (bits == 0) {
-                        bits = 0x80;
-                        glyphData++;
-                    }
-
-                    if ((*glyphData & bits) != 0) {
-                        *ptr = color & 0xFF;
-                    }
-
-                    bits >>= 1;
-                    ptr++;
-                }
-                glyphData++;
-                ptr += pitch - glyph->width;
-            }
-
-            ptr = end;
+        int characterLength;
+        int ch = textFontDecodeCharacterImpl(string, &characterLength);
+        if (characterLength == 0) {
+            break;
         }
+        string += characterLength;
+
+        TextFontGlyphView glyphView;
+        if (!textFontGetCurrentGlyphView(ch, &glyphView)) {
+            continue;
+        }
+
+        int characterWidth = textFontGetScaledGlyphWidth(glyphView);
+        unsigned char* end;
+        if ((color & DRAW_TEXT_FLAG_MONOSPACED) != 0) {
+            end = ptr + monospacedCharacterWidth;
+            ptr += (monospacedCharacterWidth - gCurrentTextFontDescriptor->letterSpacing - characterWidth) / 2;
+        } else {
+            end = ptr + characterWidth + gCurrentTextFontDescriptor->letterSpacing;
+        }
+
+        if (end - buf > length) {
+            break;
+        }
+
+        textFontDrawGlyph(ptr,
+            pitch,
+            color,
+            glyphView,
+            characterWidth,
+            gCurrentTextFontDescriptor->lineHeight);
+
+        ptr = end;
     }
 
     if ((color & DRAW_TEXT_FLAG_UNDERLINED) != 0) {
@@ -395,12 +620,18 @@ static int textFontGeStringWidthImpl(const char* string)
 {
     int width = 0;
 
-    const char* ch = string;
-    while (*ch != '\0') {
-        if (*ch < gCurrentTextFontDescriptor->glyphCount) {
-            width += gCurrentTextFontDescriptor->letterSpacing + gCurrentTextFontDescriptor->glyphs[*ch & 0xFF].width;
+    while (*string != '\0') {
+        int characterLength;
+        int ch = textFontDecodeCharacterImpl(string, &characterLength);
+        if (characterLength == 0) {
+            break;
         }
-        ch++;
+        string += characterLength;
+
+        TextFontGlyphView glyphView;
+        if (textFontGetCurrentGlyphView(ch, &glyphView)) {
+            width += gCurrentTextFontDescriptor->letterSpacing + textFontGetScaledGlyphWidth(glyphView);
+        }
     }
 
     return width;
@@ -409,13 +640,31 @@ static int textFontGeStringWidthImpl(const char* string)
 // 0x4D5BA4 GNW_text_char_width
 static int textFontGetCharacterWidthImpl(int ch)
 {
-    return gCurrentTextFontDescriptor->glyphs[ch & 0xFF].width;
+    TextFontGlyphView glyphView;
+    if (!textFontGetCurrentGlyphView(ch, &glyphView)) {
+        return 0;
+    }
+
+    return textFontGetScaledGlyphWidth(glyphView);
 }
 
 // 0x4D5BB8 GNW_text_mono_width
 static int textFontGetMonospacedStringWidthImpl(const char* string)
 {
-    return fontGetMonospacedCharacterWidth() * strlen(string);
+    int characters = 0;
+
+    while (*string != '\0') {
+        int characterLength;
+        textFontDecodeCharacterImpl(string, &characterLength);
+        if (characterLength == 0) {
+            break;
+        }
+
+        string += characterLength;
+        characters++;
+    }
+
+    return fontGetMonospacedCharacterWidth() * characters;
 }
 
 // 0x4D5BD8 GNW_text_spacing
@@ -433,16 +682,28 @@ static int textFontGetBufferSizeImpl(const char* string)
 // 0x4D5BF8 GNW_text_max
 static int textFontGetMonospacedCharacterWidthImpl()
 {
-    int width = 0;
+    int width = gCurrentTextFontDescriptor->maxGlyphWidth;
 
-    for (int index = 0; index < gCurrentTextFontDescriptor->glyphCount; index++) {
-        TextFontGlyph* glyph = &(gCurrentTextFontDescriptor->glyphs[index]);
-        if (width < glyph->width) {
-            width = glyph->width;
+    if (gCurrentTextFontDescriptor->glyphCount <= 256) {
+        for (int font = 0; font < TEXT_FONT_MAX; font++) {
+            TextFontDescriptor* fontDescriptor = &(gTextFontDescriptors[font]);
+            if (fontDescriptor->glyphCount <= 256) {
+                continue;
+            }
+
+            TextFontGlyphView glyphView;
+            glyphView.width = fontDescriptor->maxGlyphWidth;
+            glyphView.height = fontDescriptor->lineHeight;
+            width = std::max(width, textFontGetScaledGlyphWidth(glyphView));
         }
     }
 
     return width + gCurrentTextFontDescriptor->letterSpacing;
+}
+
+static int textFontDecodeCharacterImpl(const char* string, int* length)
+{
+    return textFontDecodeDbcsCharacter(string, length);
 }
 
 void fontDrawText2D(const Buffer2D& dest, int xPos, int yPos, const char* string, int length, int color)

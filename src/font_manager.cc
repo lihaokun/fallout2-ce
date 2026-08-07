@@ -44,6 +44,7 @@ static int interfaceFontGetMonospacedStringWidthImpl(const char* string);
 static int interfaceFontGetLetterSpacingImpl();
 static int interfaceFontGetBufferSizeImpl(const char* string);
 static int interfaceFontGetMonospacedCharacterWidthImpl();
+static int interfaceFontDecodeCharacterImpl(const char* string, int* length);
 static void interfaceFontDrawImpl(unsigned char* buf, const char* string, int length, int pitch, int color);
 static void interfaceFontByteSwapUInt32(unsigned int* value);
 static void interfaceFontByteSwapInt32(int* value);
@@ -51,6 +52,9 @@ static void interfaceFontByteSwapUInt16(unsigned short* value);
 static void interfaceFontByteSwapInt16(short* value);
 static void interfaceFontDrawScaledImpl(const Buffer2D& dest, int x, int y, const char* string, int color, float scale);
 static int interfaceFontGetScaledWidthImpl(const char* string, int color, float scale);
+static int interfaceFontGetDbcsGlyphWidth(const TextFontGlyphView& glyphView);
+static void interfaceFontDrawDbcsGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
+static void interfaceFontDrawDbcsGlyphScaled2D(const Buffer2D& dest, int x, int y, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
 
 // 0x518680 gFMInit
 static bool gInterfaceFontsInitialized = false;
@@ -71,6 +75,7 @@ FontManager gModernFontManager = {
     interfaceFontGetLetterSpacingImpl,
     interfaceFontGetBufferSizeImpl,
     interfaceFontGetMonospacedCharacterWidthImpl,
+    interfaceFontDecodeCharacterImpl,
 };
 
 // 0x586838 gFontCache
@@ -279,16 +284,14 @@ static int interfaceFontGetStringWidthImpl(const char* string)
     int stringWidth = 0;
 
     while (*string != '\0') {
-        unsigned char ch = static_cast<unsigned char>(*string++);
-
-        int characterWidth;
-        if (ch == ' ') {
-            characterWidth = gCurrentInterfaceFontDescriptor->wordSpacing;
-        } else {
-            characterWidth = gCurrentInterfaceFontDescriptor->glyphs[ch].width;
+        int characterLength;
+        int ch = interfaceFontDecodeCharacterImpl(string, &characterLength);
+        if (characterLength == 0) {
+            break;
         }
+        string += characterLength;
 
-        stringWidth += characterWidth + gCurrentInterfaceFontDescriptor->letterSpacing;
+        stringWidth += interfaceFontGetCharacterWidthImpl(ch) + gCurrentInterfaceFontDescriptor->letterSpacing;
     }
 
     return stringWidth;
@@ -297,19 +300,28 @@ static int interfaceFontGetStringWidthImpl(const char* string)
 // 0x4421DC FMtext_char_width
 static int interfaceFontGetCharacterWidthImpl(int ch)
 {
-    int width;
-
     if (!gInterfaceFontsInitialized) {
         return 0;
     }
 
-    if (ch == ' ') {
-        width = gCurrentInterfaceFontDescriptor->wordSpacing;
-    } else {
-        width = gCurrentInterfaceFontDescriptor->glyphs[ch].width;
+    if (ch > 0xFF) {
+        TextFontGlyphView glyphView;
+        if (textFontGetDbcsGlyph(ch, &glyphView)) {
+            return interfaceFontGetDbcsGlyphWidth(glyphView);
+        }
+
+        return 0;
     }
 
-    return width;
+    if (ch < 0) {
+        return 0;
+    }
+
+    if (ch == ' ') {
+        return gCurrentInterfaceFontDescriptor->wordSpacing;
+    }
+
+    return gCurrentInterfaceFontDescriptor->glyphs[ch].width;
 }
 
 // 0x442210 FMtext_mono_width
@@ -319,7 +331,19 @@ static int interfaceFontGetMonospacedStringWidthImpl(const char* str)
         return 0;
     }
 
-    return interfaceFontGetMonospacedCharacterWidthImpl() * strlen(str);
+    int characters = 0;
+    while (*str != '\0') {
+        int characterLength;
+        interfaceFontDecodeCharacterImpl(str, &characterLength);
+        if (characterLength == 0) {
+            break;
+        }
+
+        str += characterLength;
+        characters++;
+    }
+
+    return interfaceFontGetMonospacedCharacterWidthImpl() * characters;
 }
 
 // 0x442240 FMtext_spacing
@@ -383,14 +407,14 @@ static void interfaceFontDrawImpl(unsigned char* buf, const char* string, int le
 
     unsigned char* ptr = buf;
     while (*string != '\0') {
-        unsigned char ch = static_cast<unsigned char>(*string++);
-
-        int characterWidth;
-        if (ch == ' ') {
-            characterWidth = gCurrentInterfaceFontDescriptor->wordSpacing;
-        } else {
-            characterWidth = gCurrentInterfaceFontDescriptor->glyphs[ch].width;
+        int characterLength;
+        int ch = interfaceFontDecodeCharacterImpl(string, &characterLength);
+        if (characterLength == 0) {
+            break;
         }
+        string += characterLength;
+
+        int characterWidth = interfaceFontGetCharacterWidthImpl(ch);
 
         unsigned char* end;
         if ((color & DRAW_TEXT_FLAG_MONOSPACED) != 0) {
@@ -404,20 +428,32 @@ static void interfaceFontDrawImpl(unsigned char* buf, const char* string, int le
             break;
         }
 
-        InterfaceFontGlyph* glyph = &(gCurrentInterfaceFontDescriptor->glyphs[ch]);
-        unsigned char* glyphDataPtr = gCurrentInterfaceFontDescriptor->data + glyph->offset;
-
-        // Skip blank pixels (difference between font's line height and glyph height).
-        ptr += (gCurrentInterfaceFontDescriptor->maxHeight - glyph->height) * pitch;
-
-        for (int y = 0; y < glyph->height; y++) {
-            for (int x = 0; x < glyph->width; x++) {
-                unsigned char byte = *glyphDataPtr++;
-
-                *ptr++ = palette[(byte << 8) + *ptr];
+        if (ch > 0xFF) {
+            TextFontGlyphView glyphView;
+            if (textFontGetDbcsGlyph(ch, &glyphView)) {
+                interfaceFontDrawDbcsGlyph(ptr,
+                    pitch,
+                    color,
+                    glyphView,
+                    characterWidth,
+                    gCurrentInterfaceFontDescriptor->maxHeight);
             }
+        } else {
+            InterfaceFontGlyph* glyph = &(gCurrentInterfaceFontDescriptor->glyphs[ch]);
+            unsigned char* glyphDataPtr = gCurrentInterfaceFontDescriptor->data + glyph->offset;
 
-            ptr += pitch - glyph->width;
+            // Skip blank pixels (difference between font's line height and glyph height).
+            ptr += (gCurrentInterfaceFontDescriptor->maxHeight - glyph->height) * pitch;
+
+            for (int y = 0; y < glyph->height; y++) {
+                for (int x = 0; x < glyph->width; x++) {
+                    unsigned char byte = *glyphDataPtr++;
+
+                    *ptr++ = palette[(byte << 8) + *ptr];
+                }
+
+                ptr += pitch - glyph->width;
+            }
         }
 
         ptr = end;
@@ -449,37 +485,55 @@ static void interfaceFontDrawScaledImpl(const Buffer2D& dest, int x, int y, cons
 
     float cursorX = static_cast<float>(x);
     while (*string != '\0') {
-        unsigned char ch = static_cast<unsigned char>(*string++);
+        int characterLength;
+        int ch = interfaceFontDecodeCharacterImpl(string, &characterLength);
+        if (characterLength == 0) {
+            break;
+        }
+        string += characterLength;
 
-        int characterWidth = ch == ' '
-            ? gCurrentInterfaceFontDescriptor->wordSpacing
-            : gCurrentInterfaceFontDescriptor->glyphs[ch].width;
+        int characterWidth = interfaceFontGetCharacterWidthImpl(ch);
 
         int advance = characterWidth + gCurrentInterfaceFontDescriptor->letterSpacing;
         int glyphX = static_cast<int>(lround(cursorX));
 
-        InterfaceFontGlyph* glyph = &(gCurrentInterfaceFontDescriptor->glyphs[ch]);
-        if (glyph->width > 0 && glyph->height > 0) {
-            unsigned char* glyphData = gCurrentInterfaceFontDescriptor->data + glyph->offset;
-            int scaledGlyphWidth = std::max(1, static_cast<int>(lround(glyph->width * scale)));
-            int scaledGlyphHeight = std::max(1, static_cast<int>(lround(glyph->height * scale)));
-            int glyphY = y + std::max(0, static_cast<int>(lround((gCurrentInterfaceFontDescriptor->maxHeight - glyph->height) * scale)));
+        if (ch > 0xFF) {
+            TextFontGlyphView glyphView;
+            if (textFontGetDbcsGlyph(ch, &glyphView)) {
+                int scaledGlyphWidth = std::max(1, static_cast<int>(lround(characterWidth * scale)));
+                int scaledGlyphHeight = std::max(1, static_cast<int>(lround(gCurrentInterfaceFontDescriptor->maxHeight * scale)));
+                interfaceFontDrawDbcsGlyphScaled2D(dest,
+                    glyphX,
+                    y,
+                    color,
+                    glyphView,
+                    scaledGlyphWidth,
+                    scaledGlyphHeight);
+            }
+        } else {
+            InterfaceFontGlyph* glyph = &(gCurrentInterfaceFontDescriptor->glyphs[ch]);
+            if (glyph->width > 0 && glyph->height > 0) {
+                unsigned char* glyphData = gCurrentInterfaceFontDescriptor->data + glyph->offset;
+                int scaledGlyphWidth = std::max(1, static_cast<int>(lround(glyph->width * scale)));
+                int scaledGlyphHeight = std::max(1, static_cast<int>(lround(glyph->height * scale)));
+                int glyphY = y + std::max(0, static_cast<int>(lround((gCurrentInterfaceFontDescriptor->maxHeight - glyph->height) * scale)));
 
-            int destLeft = std::max(glyphX, 0);
-            int destTop = std::max(glyphY, 0);
-            int destRight = std::min(glyphX + scaledGlyphWidth, dest.width);
-            int destBottom = std::min(glyphY + scaledGlyphHeight, dest.height);
+                int destLeft = std::max(glyphX, 0);
+                int destTop = std::max(glyphY, 0);
+                int destRight = std::min(glyphX + scaledGlyphWidth, dest.width);
+                int destBottom = std::min(glyphY + scaledGlyphHeight, dest.height);
 
-            for (int destY = destTop; destY < destBottom; destY++) {
-                int scaledY = destY - glyphY;
-                int srcY = std::clamp(static_cast<int>(scaledY / scale), 0, glyph->height - 1);
+                for (int destY = destTop; destY < destBottom; destY++) {
+                    int scaledY = destY - glyphY;
+                    int srcY = std::clamp(static_cast<int>(scaledY / scale), 0, glyph->height - 1);
 
-                for (int destX = destLeft; destX < destRight; destX++) {
-                    int scaledX = destX - glyphX;
-                    int srcX = std::clamp(static_cast<int>(scaledX / scale), 0, glyph->width - 1);
-                    unsigned char byte = glyphData[srcY * glyph->width + srcX];
-                    unsigned char* pixel = dest.data + destY * dest.width + destX;
-                    *pixel = palette[(byte << 8) + *pixel];
+                    for (int destX = destLeft; destX < destRight; destX++) {
+                        int scaledX = destX - glyphX;
+                        int srcX = std::clamp(static_cast<int>(scaledX / scale), 0, glyph->width - 1);
+                        unsigned char byte = glyphData[srcY * glyph->width + srcX];
+                        unsigned char* pixel = dest.data + destY * dest.width + destX;
+                        *pixel = palette[(byte << 8) + *pixel];
+                    }
                 }
             }
         }
@@ -501,15 +555,86 @@ static int interfaceFontGetScaledWidthImpl(const char* string, int color, float 
 
     float width = 0.0f;
     while (*string != '\0') {
-        unsigned char ch = static_cast<unsigned char>(*string++);
-        int characterWidth = ch == ' '
-            ? gCurrentInterfaceFontDescriptor->wordSpacing
-            : gCurrentInterfaceFontDescriptor->glyphs[ch].width;
+        int characterLength;
+        int ch = interfaceFontDecodeCharacterImpl(string, &characterLength);
+        if (characterLength == 0) {
+            break;
+        }
+        string += characterLength;
+
+        int characterWidth = interfaceFontGetCharacterWidthImpl(ch);
         int advance = characterWidth + gCurrentInterfaceFontDescriptor->letterSpacing;
         width += advance * scale;
     }
 
     return std::max(0, static_cast<int>(lround(width)));
+}
+
+static int interfaceFontDecodeCharacterImpl(const char* string, int* length)
+{
+    return textFontDecodeDbcsCharacter(string, length);
+}
+
+static int interfaceFontGetDbcsGlyphWidth(const TextFontGlyphView& glyphView)
+{
+    if (glyphView.width <= 0 || glyphView.height <= 0) {
+        return 0;
+    }
+
+    return std::max(1, (glyphView.width * gCurrentInterfaceFontDescriptor->maxHeight + glyphView.height / 2) / glyphView.height);
+}
+
+static void interfaceFontDrawDbcsGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
+{
+    if (glyphView.data == nullptr
+        || glyphView.width <= 0
+        || glyphView.height <= 0
+        || targetWidth <= 0
+        || targetHeight <= 0) {
+        return;
+    }
+
+    for (int y = 0; y < targetHeight; y++) {
+        int sourceY = y * glyphView.height / targetHeight;
+        const unsigned char* sourceRow = glyphView.data + sourceY * glyphView.rowBytes;
+        unsigned char* destination = buf + y * pitch;
+
+        for (int x = 0; x < targetWidth; x++) {
+            int sourceX = x * glyphView.width / targetWidth;
+            if ((sourceRow[sourceX >> 3] & (0x80 >> (sourceX & 7))) != 0) {
+                destination[x] = color & 0xFF;
+            }
+        }
+    }
+}
+
+static void interfaceFontDrawDbcsGlyphScaled2D(const Buffer2D& dest, int x, int y, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
+{
+    if (dest.data == nullptr
+        || glyphView.data == nullptr
+        || glyphView.width <= 0
+        || glyphView.height <= 0
+        || targetWidth <= 0
+        || targetHeight <= 0) {
+        return;
+    }
+
+    int destinationLeft = std::max(x, 0);
+    int destinationTop = std::max(y, 0);
+    int destinationRight = std::min(x + targetWidth, dest.width);
+    int destinationBottom = std::min(y + targetHeight, dest.height);
+
+    for (int destinationY = destinationTop; destinationY < destinationBottom; destinationY++) {
+        int sourceY = (destinationY - y) * glyphView.height / targetHeight;
+        const unsigned char* sourceRow = glyphView.data + sourceY * glyphView.rowBytes;
+
+        for (int destinationX = destinationLeft; destinationX < destinationRight; destinationX++) {
+            int sourceX = (destinationX - x) * glyphView.width / targetWidth;
+            if ((sourceRow[sourceX >> 3] & (0x80 >> (sourceX & 7))) != 0) {
+                dest.data[destinationY * dest.width + destinationX] = color & 0xFF;
+            }
+        }
+    }
 }
 
 // NOTE: Inlined.

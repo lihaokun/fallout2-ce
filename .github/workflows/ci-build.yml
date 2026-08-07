@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feature/gbk-cjk-font-support
   pull_request:
     types:
       - opened

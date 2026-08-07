@@ -16,6 +16,14 @@ typedef int FontManagerGetMonospacedStringWidthProc(const char* string);
 typedef int FontManagerGetLetterSpacingProc();
 typedef int FontManagerGetBufferSizeProc(const char* string);
 typedef int FontManagerGetMonospacedCharacterWidth();
+typedef int FontManagerDecodeCharacterProc(const char* string, int* length);
+
+typedef struct TextFontGlyphView {
+    int width;
+    int height;
+    int rowBytes;
+    const unsigned char* data;
+} TextFontGlyphView;
 
 typedef struct FontManager {
     int minFont;
@@ -29,6 +37,7 @@ typedef struct FontManager {
     FontManagerGetLetterSpacingProc* getLetterSpacingProc;
     FontManagerGetBufferSizeProc* getBufferSizeProc;
     FontManagerGetMonospacedCharacterWidth* getMonospacedCharacterWidthProc;
+    FontManagerDecodeCharacterProc* decodeCharacterProc;
 } FontManager;
 
 extern FontManager gTextFontManager;
@@ -42,12 +51,15 @@ extern FontManagerGetMonospacedStringWidthProc* fontGetMonospacedStringWidth;
 extern FontManagerGetLetterSpacingProc* fontGetLetterSpacing;
 extern FontManagerGetBufferSizeProc* fontGetBufferSize;
 extern FontManagerGetMonospacedCharacterWidth* fontGetMonospacedCharacterWidth;
+extern FontManagerDecodeCharacterProc* fontDecodeCharacter;
 
 void fontDrawText2D(const Buffer2D& dest, int xPos, int yPos, const char* string, int length, int color);
 
 int textFontsInit();
 void textFontsExit();
 int textFontLoad(int font);
+int textFontDecodeDbcsCharacter(const char* string, int* length);
+bool textFontGetDbcsGlyph(int ch, TextFontGlyphView* glyphView);
 int fontManagerAdd(FontManager* fontManager);
 int fontGetCurrent();
 void fontSetCurrent(int font);

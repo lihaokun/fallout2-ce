@@ -608,17 +608,29 @@ static int _mainDeathGrabTextFile(const char* fileName, char* dest)
 // 0x481598
 static int _mainDeathWordWrap(char* text, int width, short* beginnings, short* count)
 {
-    while (true) {
-        char* sep = strchr(text, ':');
-        if (sep == nullptr) {
-            break;
+    // Death subtitle files use numeric line markers (for example "1:").
+    // Newlines have already been converted to spaces, so only strip markers
+    // that begin an ASCII token. Colons in the narration itself must remain.
+    char* cursor = text;
+    while (*cursor != '\0') {
+        while (*cursor == ' ') {
+            cursor++;
         }
 
-        if (sep - 1 < text) {
-            break;
+        char* marker = cursor;
+        while (*cursor >= '0' && *cursor <= '9') {
+            cursor++;
         }
-        sep[0] = ' ';
-        sep[-1] = ' ';
+
+        if (cursor > marker && *cursor == ':') {
+            while (marker <= cursor) {
+                *marker++ = ' ';
+            }
+        } else {
+            while (*cursor != '\0' && *cursor != ' ') {
+                cursor++;
+            }
+        }
     }
 
     if (wordWrap(text, width, beginnings, count) == -1) {
@@ -629,15 +641,9 @@ static int _mainDeathWordWrap(char* text, int width, short* beginnings, short* c
     *count -= 1;
 
     for (int index = 1; index < *count; index++) {
-        char* p = text + beginnings[index];
-        while (p >= text && *p != ' ') {
-            p--;
-            beginnings[index]--;
-        }
-
-        if (p != nullptr) {
-            *p = '\0';
-            beginnings[index]++;
+        int boundary = beginnings[index];
+        if (boundary > beginnings[index - 1] && text[boundary - 1] == ' ') {
+            text[boundary - 1] = '\0';
         }
     }
 

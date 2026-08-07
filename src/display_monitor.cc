@@ -1,5 +1,6 @@
 #include "display_monitor.h"
 
+#include <algorithm>
 #include <string.h>
 
 #include <fstream>
@@ -70,6 +71,7 @@ static int gDisplayMonitorScrollUpButton = -1;
 
 // 0x56DBFC display_string_buf
 static char gDisplayMonitorLines[DISPLAY_MONITOR_LINES_CAPACITY][DISPLAY_MONITOR_LINE_LENGTH];
+static bool gDisplayMonitorLineHasKnob[DISPLAY_MONITOR_LINES_CAPACITY];
 
 // 0x56FB3C disp_buf
 static unsigned char* gDisplayMonitorBackgroundFrmData;
@@ -257,68 +259,77 @@ void displayMonitorAddMessage(const char* str)
         }
     }
 
-    std::string mutableMessage(str);
-    char* mutableStr = mutableMessage.data();
+    const char* lineStart = str;
+    do {
+        int lineWidth = 0;
+        int maximumWidth = DISPLAY_MONITOR_WIDTH - _max_disp - knobWidth;
+        const char* pch = lineStart;
+        const char* previousBreak = nullptr;
 
-    // TODO: Refactor these two loops.
-    char* splitPos = nullptr;
-    while (true) {
-        while (fontGetStringWidth(mutableStr) < DISPLAY_MONITOR_WIDTH - _max_disp - knobWidth) {
-            char* temp = gDisplayMonitorLines[_disp_start];
-            int length;
-            if (knob != '\0') {
-                *temp++ = knob;
-                length = DISPLAY_MONITOR_LINE_LENGTH - 2;
-                knob = '\0';
-                knobWidth = 0;
-            } else {
-                length = DISPLAY_MONITOR_LINE_LENGTH - 1;
-            }
-            strncpy(temp, mutableStr, length);
-            gDisplayMonitorLines[_disp_start][DISPLAY_MONITOR_LINE_LENGTH - 1] = '\0';
-            _disp_start = (_disp_start + 1) % gDisplayMonitorLinesCapacity;
-
-            if (splitPos == nullptr) {
-                fontSetCurrent(oldFont);
-                _disp_curr = _disp_start;
-                displayMonitorRefresh();
-                return;
+        while (*pch != '\0') {
+            int characterLength;
+            int ch = fontDecodeCharacter(pch, &characterLength);
+            if (characterLength <= 0) {
+                break;
             }
 
-            mutableStr = splitPos + 1;
-            *splitPos = ' ';
-            splitPos = nullptr;
+            int characterWidth = fontGetCharacterWidth(ch) + fontGetLetterSpacing();
+            if (lineWidth + characterWidth > maximumWidth) {
+                break;
+            }
+
+            lineWidth += characterWidth;
+            pch += characterLength;
+            if (ch == ' ' || ch == '-') {
+                previousBreak = pch;
+            }
         }
 
-        char* space = strrchr(mutableStr, ' ');
-        if (space == nullptr) {
-            break;
+        const char* lineEnd = pch;
+        if (*pch != '\0' && previousBreak != nullptr) {
+            lineEnd = previousBreak;
         }
 
-        if (splitPos != nullptr) {
-            *splitPos = ' ';
+        if (lineEnd == lineStart && *lineStart != '\0') {
+            int characterLength;
+            fontDecodeCharacter(lineStart, &characterLength);
+            lineEnd = lineStart + std::max(characterLength, 1);
         }
 
-        splitPos = space;
-        if (space != nullptr) {
-            *space = '\0';
+        char* destination = gDisplayMonitorLines[_disp_start];
+        int capacity = DISPLAY_MONITOR_LINE_LENGTH - 1;
+        gDisplayMonitorLineHasKnob[_disp_start] = knob != '\0';
+        if (knob != '\0') {
+            knob = '\0';
+            knobWidth = 0;
         }
-    }
 
-    char* temp = gDisplayMonitorLines[_disp_start];
-    int length;
-    if (knob != '\0') {
-        temp++;
-        gDisplayMonitorLines[_disp_start][0] = knob;
-        length = DISPLAY_MONITOR_LINE_LENGTH - 2;
-        knob = '\0';
-    } else {
-        length = DISPLAY_MONITOR_LINE_LENGTH - 1;
-    }
-    strncpy(temp, mutableStr, length);
+        // Pixel width is normally the limiting factor, but retain the legacy
+        // byte cap and stop only at a complete character boundary.
+        const char* safeEnd = lineStart;
+        const char* scan = lineStart;
+        while (scan < lineEnd) {
+            int characterLength;
+            fontDecodeCharacter(scan, &characterLength);
+            if (characterLength <= 0 || scan + characterLength > lineEnd || scan + characterLength - lineStart > capacity) {
+                break;
+            }
 
-    gDisplayMonitorLines[_disp_start][DISPLAY_MONITOR_LINE_LENGTH - 1] = '\0';
-    _disp_start = (_disp_start + 1) % gDisplayMonitorLinesCapacity;
+            scan += characterLength;
+            safeEnd = scan;
+        }
+
+        size_t length = safeEnd - lineStart;
+        memcpy(destination, lineStart, length);
+        destination[length] = '\0';
+
+        _disp_start = (_disp_start + 1) % gDisplayMonitorLinesCapacity;
+
+        lineStart = safeEnd;
+        while (*lineStart == ' ') {
+            lineStart++;
+        }
+    } while (*lineStart != '\0');
 
     fontSetCurrent(oldFont);
     _disp_curr = _disp_start;
@@ -335,6 +346,7 @@ static void display_clear()
     if (gDisplayMonitorInitialized) {
         for (index = 0; index < gDisplayMonitorLinesCapacity; index++) {
             gDisplayMonitorLines[index][0] = '\0';
+            gDisplayMonitorLineHasKnob[index] = false;
         }
 
         _disp_start = 0;
@@ -366,9 +378,21 @@ static void displayMonitorRefresh()
     int oldFont = fontGetCurrent();
     fontSetCurrent(DISPLAY_MONITOR_FONT);
 
+    char knobString[] = { '\x95', '\0' };
+    int knobWidth = fontGetStringWidth(knobString);
+
     for (int index = 0; index < _max_disp; index++) {
         int stringIndex = (_disp_curr + gDisplayMonitorLinesCapacity + index - _max_disp) % gDisplayMonitorLinesCapacity;
-        fontDrawText(buf + index * _intface_full_width * fontGetLineHeight(), gDisplayMonitorLines[stringIndex], DISPLAY_MONITOR_WIDTH, _intface_full_width, COLOR_GREEN);
+        unsigned char* lineBuffer = buf + index * _intface_full_width * fontGetLineHeight();
+        if (gDisplayMonitorLineHasKnob[stringIndex]) {
+            fontDrawText(lineBuffer, knobString, knobWidth, _intface_full_width, COLOR_GREEN);
+            lineBuffer += knobWidth;
+        }
+        fontDrawText(lineBuffer,
+            gDisplayMonitorLines[stringIndex],
+            DISPLAY_MONITOR_WIDTH - (gDisplayMonitorLineHasKnob[stringIndex] ? knobWidth : 0),
+            _intface_full_width,
+            COLOR_GREEN);
 
         // Even though the display monitor is rectangular, it's graphic is not.
         // To give a feel of depth it's covered by some metal canopy and

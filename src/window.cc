@@ -1136,44 +1136,67 @@ char** windowWordWrap(char* string, int maxLength, int indent, int* substringLis
 
     char* start = string;
     char* pch = string;
+    char* previousSpace = nullptr;
     int width = indent;
     while (*pch != '\0') {
-        width += fontGetCharacterWidth(*pch & 0xFF);
-        if (*pch != '\n' && width <= maxLength) {
-            width += fontGetLetterSpacing();
-            pch++;
-        } else {
-            while (width > maxLength) {
-                width -= fontGetCharacterWidth(*pch);
-                pch--;
-            }
-
-            if (*pch != '\n') {
-                while (pch != start && *pch != ' ') {
-                    pch--;
-                }
-            }
-
-            if (substringList != nullptr) {
-                substringList = (char**)internal_realloc_safe(substringList, sizeof(*substringList) * (substringListLength + 1), __FILE__, __LINE__); // "..\int\WINDOW.C", 1166
-            } else {
-                substringList = (char**)internal_malloc_safe(sizeof(*substringList), __FILE__, __LINE__); // "..\int\WINDOW.C", 1167
-            }
-
-            char* substring = (char*)internal_malloc_safe(pch - start + 1, __FILE__, __LINE__); // "..\int\WINDOW.C", 1169
-            strncpy(substring, start, pch - start);
-            substring[pch - start] = '\0';
-
-            substringList[substringListLength] = substring;
-
-            while (*pch == ' ') {
-                pch++;
-            }
-
-            width = 0;
-            start = pch;
-            substringListLength++;
+        int characterLength;
+        int ch = fontDecodeCharacter(pch, &characterLength);
+        if (characterLength <= 0) {
+            break;
         }
+
+        int characterWidth = fontGetCharacterWidth(ch);
+        if (ch != '\n' && width + characterWidth <= maxLength) {
+            width += characterWidth + fontGetLetterSpacing();
+            if (ch == ' ') {
+                previousSpace = pch;
+            }
+
+            pch += characterLength;
+            continue;
+        }
+
+        char* end;
+        char* next;
+        if (ch == '\n') {
+            end = pch;
+            next = pch + characterLength;
+        } else if (previousSpace != nullptr && previousSpace >= start) {
+            end = previousSpace;
+            next = previousSpace + 1;
+        } else if (pch != start) {
+            // Character wrap. Since pch points to the beginning of the next
+            // character, this cannot split a DBCS glyph.
+            end = pch;
+            next = pch;
+        } else {
+            // A malformed font can report a character wider than maxLength.
+            // Consume it so wrapping still makes forward progress.
+            end = pch + characterLength;
+            next = end;
+        }
+
+        if (substringList != nullptr) {
+            substringList = (char**)internal_realloc_safe(substringList, sizeof(*substringList) * (substringListLength + 1), __FILE__, __LINE__); // "..\int\WINDOW.C", 1166
+        } else {
+            substringList = (char**)internal_malloc_safe(sizeof(*substringList), __FILE__, __LINE__); // "..\int\WINDOW.C", 1167
+        }
+
+        char* substring = (char*)internal_malloc_safe(end - start + 1, __FILE__, __LINE__); // "..\int\WINDOW.C", 1169
+        strncpy(substring, start, end - start);
+        substring[end - start] = '\0';
+
+        substringList[substringListLength] = substring;
+        substringListLength++;
+
+        while (*next == ' ') {
+            next++;
+        }
+
+        start = next;
+        pch = next;
+        previousSpace = nullptr;
+        width = 0;
     }
 
     if (start != pch) {
