@@ -2,6 +2,7 @@
 
 #include <SDL.h>
 #include <string.h>
+#include <string>
 #include <vector>
 
 #include "color.h"
@@ -17,6 +18,7 @@
 #include "settings.h"
 #include "sound.h"
 #include "svga.h"
+#include "text_encoding.h"
 #include "text_font.h"
 #include "window.h"
 #include "window_manager.h"
@@ -558,8 +560,8 @@ static void movieLoadSubtitles(char* filePath)
     strcpy(path, filePath);
 
     debugPrint("Opening subtitle file %s\n", path);
-    File* stream = fileOpen(path, "r");
-    if (stream == nullptr) {
+    std::string contents;
+    if (!textEncodingLoadFile(path, &contents)) {
         debugPrint("Couldn't open subtitle file %s\n", path);
         gMovieFlags &= ~MOVIE_EXTENDED_FLAG_SUBTITLES;
         return;
@@ -567,36 +569,21 @@ static void movieLoadSubtitles(char* filePath)
 
     MovieSubtitleListNode* prev = nullptr;
     int subtitleCount = 0;
-    while (!fileEof(stream)) {
-        char string[260];
-        string[0] = '\0';
-        fileReadString(string, 259, stream);
-        if (*string == '\0') {
-            break;
-        }
+    size_t lineStart = 0;
+    while (lineStart < contents.size()) {
+        size_t nextLine = contents.find('\n', lineStart);
+        size_t lineEnd = nextLine == std::string::npos ? contents.size() : nextLine;
+        if (lineEnd > lineStart && contents[lineEnd - 1] == '\r') lineEnd--;
 
-        MovieSubtitleListNode* subtitle = (MovieSubtitleListNode*)internal_malloc_safe(sizeof(*subtitle), __FILE__, __LINE__); // "..\\int\\MOVIE.C", 1050
-        subtitle->next = nullptr;
+        size_t separator = contents.find(':', lineStart);
+        if (separator != std::string::npos && separator < lineEnd) {
+            std::string timing = contents.substr(lineStart, separator - lineStart);
+            std::string text = contents.substr(separator + 1, lineEnd - separator - 1);
 
-        subtitleCount++;
-
-        char* pch;
-
-        pch = strchr(string, '\n');
-        if (pch != nullptr) {
-            *pch = '\0';
-        }
-
-        pch = strchr(string, '\r');
-        if (pch != nullptr) {
-            *pch = '\0';
-        }
-
-        pch = strchr(string, ':');
-        if (pch != nullptr) {
-            *pch = '\0';
-            subtitle->num = atoi(string);
-            subtitle->text = strdup_safe(pch + 1, __FILE__, __LINE__); // "..\\int\\MOVIE.C", 1058
+            MovieSubtitleListNode* subtitle = (MovieSubtitleListNode*)internal_malloc_safe(sizeof(*subtitle), __FILE__, __LINE__); // "..\\int\\MOVIE.C", 1050
+            subtitle->next = nullptr;
+            subtitle->num = atoi(timing.c_str());
+            subtitle->text = strdup_safe(text.c_str(), __FILE__, __LINE__); // "..\\int\\MOVIE.C", 1058
 
             if (prev != nullptr) {
                 prev->next = subtitle;
@@ -605,12 +592,15 @@ static void movieLoadSubtitles(char* filePath)
             }
 
             prev = subtitle;
+            subtitleCount++;
         } else {
-            debugPrint("subtitle: couldn't parse %s\n", string);
+            std::string line = contents.substr(lineStart, lineEnd - lineStart);
+            if (!line.empty()) debugPrint("subtitle: couldn't parse %s\n", line.c_str());
         }
-    }
 
-    fileClose(stream);
+        if (nextLine == std::string::npos) break;
+        lineStart = nextLine + 1;
+    }
 
     debugPrint("Read %d subtitles\n", subtitleCount);
 }

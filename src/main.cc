@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <string>
+
 #include "art.h"
 #include "autorun.h"
 #include "character_selector.h"
@@ -36,6 +38,7 @@
 #include "sfall_callbacks.h"
 #include "sfall_global_scripts.h"
 #include "svga.h"
+#include "text_encoding.h"
 #include "text_font.h"
 #include "window.h"
 #include "window_manager.h"
@@ -59,7 +62,7 @@ static bool mainTryParseDevLoadGameSlot(const char* value, int* slotPtr);
 static void mainLoop();
 static void showDeath();
 static void _main_death_voiceover_callback();
-static int _mainDeathGrabTextFile(const char* fileName, char* dest);
+static int _mainDeathGrabTextFile(const char* fileName, char* dest, size_t capacity);
 static int _mainDeathWordWrap(char* text, int width, short* beginnings, short* count);
 
 // 0x5194C8 mainMap
@@ -480,7 +483,7 @@ static void showDeath()
 
             if (settings.preferences.subtitles) {
                 char text[512];
-                if (_mainDeathGrabTextFile(deathFileName, text) == 0) {
+                if (_mainDeathGrabTextFile(deathFileName, text, sizeof(text)) == 0) {
                     debugPrint("\n((ShowDeath)): %s\n", text);
 
                     short beginnings[WORD_WRAP_MAX_COUNT];
@@ -570,8 +573,12 @@ static void _main_death_voiceover_callback()
 // Read endgame subtitle.
 //
 // 0x4814B4
-static int _mainDeathGrabTextFile(const char* fileName, char* dest)
+static int _mainDeathGrabTextFile(const char* fileName, char* dest, size_t capacity)
 {
+    if (dest == nullptr || capacity == 0) {
+        return -1;
+    }
+
     const char* p = strrchr(fileName, '\\');
     if (p == nullptr) {
         return -1;
@@ -580,27 +587,35 @@ static int _mainDeathGrabTextFile(const char* fileName, char* dest)
     char path[COMPAT_MAX_PATH];
     snprintf(path, sizeof(path), "text\\%s\\cuts\\%s%s", settings.system.language.c_str(), p + 1, ".TXT");
 
-    File* stream = fileOpen(path, "rt");
-    if (stream == nullptr) {
+    std::string contents;
+    if (!textEncodingLoadFile(path, &contents)) {
         return -1;
     }
 
-    while (true) {
-        int c = fileReadChar(stream);
-        if (c == -1) {
+    size_t offset = 0;
+    size_t written = 0;
+    while (offset < contents.size()) {
+        unsigned char c = static_cast<unsigned char>(contents[offset]);
+        if (c == '\r') {
+            offset++;
+            continue;
+        }
+
+        size_t length = textEncodingCharacterLength(contents.data() + offset, contents.size() - offset);
+        if (written + length >= capacity) {
             break;
         }
 
         if (c == '\n') {
-            c = ' ';
+            dest[written++] = ' ';
+        } else {
+            memcpy(dest + written, contents.data() + offset, length);
+            written += length;
         }
-
-        *dest++ = (c & 0xFF);
+        offset += length;
     }
 
-    fileClose(stream);
-
-    *dest = '\0';
+    dest[written] = '\0';
 
     return 0;
 }

@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <string>
+
 #include "art.h"
 #include "color.h"
 #include "credits.h"
@@ -31,6 +33,7 @@
 #include "settings.h"
 #include "stat.h"
 #include "svga.h"
+#include "text_encoding.h"
 #include "text_font.h"
 #include "window_manager.h"
 #include "word_wrap.h"
@@ -698,7 +701,7 @@ static void endgameEndingVoiceOverInit(const char* fileBaseName)
 
         unsigned int timing = 0;
         for (int index = 0; index < gEndgameEndingSubtitlesLength; index++) {
-            double charactersCount = static_cast<double>(strlen(gEndgameEndingSubtitles[index]));
+            double charactersCount = static_cast<double>(textEncodingCharacterCount(gEndgameEndingSubtitles[index]));
             // NOTE: There is floating point math at 0x4402E6 used to add
             // timing.
             timing += (unsigned int)trunc(charactersCount * durationPerCharacter * 1000.0);
@@ -771,36 +774,32 @@ static int endgameEndingSubtitlesLoad(const char* filePath)
 {
     endgameEndingSubtitlesFree();
 
-    File* stream = fileOpen(filePath, "rt");
-    if (stream == nullptr) {
+    std::string contents;
+    if (!textEncodingLoadFile(filePath, &contents)) {
         return -1;
     }
 
-    // FIXME: There is at least one subtitle for Arroyo ending (nar_ar1) that
-    // does not fit into this buffer.
-    char string[256];
-    while (fileReadString(string, sizeof(string), stream)) {
-        char* pch;
+    size_t lineStart = 0;
+    while (lineStart < contents.size()) {
+        size_t nextLine = contents.find('\n', lineStart);
+        size_t lineEnd = nextLine == std::string::npos ? contents.size() : nextLine;
+        if (lineEnd > lineStart && contents[lineEnd - 1] == '\r') lineEnd--;
 
-        // Find and clamp string at EOL.
-        pch = strchr(string, '\n');
-        if (pch != nullptr) {
-            *pch = '\0';
-        }
-
-        // Find separator. The value before separator is ignored (as opposed to
-        // movie subtitles, where the value before separator is a timing).
-        pch = strchr(string, ':');
-        if (pch != nullptr) {
+        // The value before the separator is ignored (as opposed to movie
+        // subtitles, where it represents timing).
+        size_t separator = contents.find(':', lineStart);
+        if (separator != std::string::npos && separator < lineEnd) {
             if (gEndgameEndingSubtitlesLength < ENDGAME_ENDING_MAX_SUBTITLES) {
-                gEndgameEndingSubtitles[gEndgameEndingSubtitlesLength] = internal_strdup(pch + 1);
+                std::string subtitle = contents.substr(separator + 1, lineEnd - separator - 1);
+                gEndgameEndingSubtitles[gEndgameEndingSubtitlesLength] = internal_strdup(subtitle.c_str());
                 gEndgameEndingSubtitlesLength++;
-                gEndgameEndingSubtitlesCharactersCount += static_cast<int>(strlen(pch + 1));
+                gEndgameEndingSubtitlesCharactersCount += textEncodingCharacterCount(subtitle.c_str());
             }
         }
-    }
 
-    fileClose(stream);
+        if (nextLine == std::string::npos) break;
+        lineStart = nextLine + 1;
+    }
 
     return 0;
 }

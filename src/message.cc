@@ -17,6 +17,7 @@
 #include "proto_types.h"
 #include "random.h"
 #include "settings.h"
+#include "text_encoding.h"
 
 namespace fallout {
 
@@ -46,7 +47,7 @@ struct MessageListRepositoryState {
 static bool _message_find(MessageList* msg, int num, int* out_index);
 static bool _message_add(MessageList* msg, MessageListItem* new_entry);
 static bool _message_parse_number(int* out_num, const char* str);
-static int _message_load_field(File* file, char* str);
+static int _message_load_field(const char** cursorPtr, const char* end, char* str);
 
 static MessageList* messageListRepositoryLoad(const char* path);
 
@@ -217,7 +218,6 @@ bool messageListFree(MessageList* messageList)
 bool messageListLoad(MessageList* messageList, const char* path)
 {
     char localized_path[COMPAT_MAX_PATH];
-    File* file_ptr;
     char num[MESSAGE_LIST_ITEM_FIELD_MAX_SIZE];
     char audio[MESSAGE_LIST_ITEM_FIELD_MAX_SIZE];
     char text[MESSAGE_LIST_ITEM_FIELD_MAX_SIZE];
@@ -237,17 +237,18 @@ bool messageListLoad(MessageList* messageList, const char* path)
 
     snprintf(localized_path, sizeof(localized_path), "%s\\%s\\%s", "text", settings.system.language.c_str(), path);
 
-    file_ptr = fileOpen(localized_path, "rt");
+    std::string contents;
+    bool loaded = textEncodingLoadFile(localized_path, &contents);
 
     // SFALL: Fallback to english if requested localization does not exist.
-    if (file_ptr == nullptr) {
+    if (!loaded) {
         if (compat_stricmp(settings.system.language.c_str(), ENGLISH) != 0) {
             snprintf(localized_path, sizeof(localized_path), "%s\\%s\\%s", "text", ENGLISH, path);
-            file_ptr = fileOpen(localized_path, "rt");
+            loaded = textEncodingLoadFile(localized_path, &contents);
         }
     }
 
-    if (file_ptr == nullptr) {
+    if (!loaded) {
         return false;
     }
 
@@ -255,18 +256,20 @@ bool messageListLoad(MessageList* messageList, const char* path)
     entry.audio = audio;
     entry.text = text;
 
+    const char* cursor = contents.data();
+    const char* end = cursor + contents.size();
     while (1) {
-        rc = _message_load_field(file_ptr, num);
+        rc = _message_load_field(&cursor, end, num);
         if (rc != 0) {
             break;
         }
 
-        if (_message_load_field(file_ptr, audio) != 0) {
+        if (_message_load_field(&cursor, end, audio) != 0) {
             debugPrint("\nError loading audio field.\n", localized_path);
             goto err;
         }
 
-        if (_message_load_field(file_ptr, text) != 0) {
+        if (_message_load_field(&cursor, end, text) != 0) {
             debugPrint("\nError loading text field.\n", localized_path);
             goto err;
         }
@@ -289,10 +292,8 @@ bool messageListLoad(MessageList* messageList, const char* path)
 err:
 
     if (!success) {
-        debugPrint("Error loading message file %s at offset %x.", localized_path, fileTell(file_ptr));
+        debugPrint("Error loading message file %s at offset %x.", localized_path, static_cast<unsigned int>(cursor - contents.data()));
     }
-
-    fileClose(file_ptr);
 
     return success;
 }
@@ -483,54 +484,69 @@ static bool _message_parse_number(int* out_num, const char* str)
 // 4 - limit exceeded (> `MESSAGE_LIST_ITEM_FIELD_MAX_SIZE`)
 //
 // 0x484FB4 message_load_field
-static int _message_load_field(File* file, char* str)
+static int _message_load_field(const char** cursorPtr, const char* end, char* str)
 {
-    int ch;
-    int len;
+    if (cursorPtr == nullptr || *cursorPtr == nullptr || end == nullptr || str == nullptr) return 3;
 
-    len = 0;
+    const char* cursor = *cursorPtr;
+    int len = 0;
+    bool foundOpeningDelimiter = false;
 
-    while (1) {
-        ch = fileReadChar(file);
-        if (ch == -1) {
+    while (cursor < end) {
+        size_t characterLength = textEncodingCharacterLength(cursor, static_cast<size_t>(end - cursor));
+        if (characterLength == 0) {
+            *cursorPtr = cursor;
             return 1;
         }
 
-        if (ch == '}') {
+        if (characterLength == 1 && *cursor == '}') {
             debugPrint("\nError reading message file - mismatched delimiters.\n");
+            *cursorPtr = cursor;
             return 2;
         }
 
-        if (ch == '{') {
+        if (characterLength == 1 && *cursor == '{') {
+            cursor++;
+            foundOpeningDelimiter = true;
             break;
         }
+
+        cursor += characterLength;
     }
 
-    while (1) {
-        ch = fileReadChar(file);
+    if (!foundOpeningDelimiter) {
+        *cursorPtr = cursor;
+        return 1;
+    }
 
-        if (ch == -1) {
-            debugPrint("\nError reading message file - EOF reached.\n");
-            return 3;
-        }
+    while (cursor < end) {
+        size_t characterLength = textEncodingCharacterLength(cursor, static_cast<size_t>(end - cursor));
+        if (characterLength == 0) break;
 
-        if (ch == '}') {
-            *(str + len) = '\0';
+        if (characterLength == 1 && *cursor == '}') {
+            str[len] = '\0';
+            cursor++;
+            *cursorPtr = cursor;
             return 0;
         }
 
-        if (ch != '\n') {
-            *(str + len) = ch;
-            len++;
-
-            if (len >= MESSAGE_LIST_ITEM_FIELD_MAX_SIZE) {
+        if (!(characterLength == 1 && (*cursor == '\n' || *cursor == '\r'))) {
+            if (len + static_cast<int>(characterLength) >= MESSAGE_LIST_ITEM_FIELD_MAX_SIZE) {
                 debugPrint("\nError reading message file - text exceeds limit.\n");
+                *cursorPtr = cursor;
                 return 4;
             }
+
+            memcpy(str + len, cursor, characterLength);
+            len += static_cast<int>(characterLength);
         }
+
+        cursor += characterLength;
     }
 
-    return 0;
+    *cursorPtr = cursor;
+    debugPrint("\nError reading message file - EOF reached.\n");
+    return 3;
 }
 
 // 0x48504C getmsg

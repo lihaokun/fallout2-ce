@@ -147,6 +147,7 @@ void initSettingsRegistry(bool isMapper)
     SETTING_PATH(critter_dat);
     SETTING_PATH(critter_patches);
     SETTING(language);
+    SETTING(text_encoding);
     SETTING(scroll_lock);
     SETTING(interrupt_walk);
     SETTING(art_cache_size);

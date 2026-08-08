@@ -15,6 +15,10 @@ struct SystemSettings {
     std::string critter_dat_path = "critter.dat";
     std::string critter_patches_path = "data";
     std::string language = ENGLISH;
+    // Source encoding for localized display text: auto, legacy, or utf8.
+    // "auto" preserves legacy files and converts strictly valid UTF-8 files
+    // to the encoding expected by the active bitmap font.
+    std::string text_encoding = "auto";
     int scroll_lock = 0;
     bool interrupt_walk = true;
     int art_cache_size = 8;
