@@ -10,6 +10,7 @@
 #include "db.h"
 #include "debug.h"
 #include "memory_manager.h"
+#include "monochrome_font_scaler.h"
 #include "settings.h"
 #include "window_manager.h"
 
@@ -52,9 +53,10 @@ static void interfaceFontByteSwapUInt16(unsigned short* value);
 static void interfaceFontByteSwapInt16(short* value);
 static void interfaceFontDrawScaledImpl(const Buffer2D& dest, int x, int y, const char* string, int color, float scale);
 static int interfaceFontGetScaledWidthImpl(const char* string, int color, float scale);
+static int interfaceFontGetEffectiveMaxHeight();
 static int interfaceFontGetDbcsGlyphWidth(const TextFontGlyphView& glyphView);
-static void interfaceFontDrawDbcsGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
-static void interfaceFontDrawDbcsGlyphScaled2D(const Buffer2D& dest, int x, int y, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
+static void interfaceFontDrawDbcsGlyph(unsigned char* buf, int pitch, int color, unsigned char* palette, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
+static void interfaceFontDrawDbcsGlyphScaled2D(const Buffer2D& dest, int x, int y, int color, unsigned char* palette, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
 
 // 0x518680 gFMInit
 static bool gInterfaceFontsInitialized = false;
@@ -86,6 +88,11 @@ static int gCurrentInterfaceFont;
 
 // 0x58E93C gCurrentFont
 static InterfaceFontDescriptor* gCurrentInterfaceFontDescriptor;
+
+// Optional minimum height for CJK glyphs in carefully audited interface
+// regions. A global font 101 override is unsafe because several legacy screens
+// use fixed-height lists sized for the original metrics.
+static int gCjkInterfaceFontMinimumHeight = 0;
 
 // 0x441C80 FMInit
 int interfaceFontsInit()
@@ -119,6 +126,8 @@ int interfaceFontsInit()
 // 0x441CEC FMExit
 void interfaceFontsExit()
 {
+    monochromeFontScalerClearCache();
+
     for (int font = 0; font < INTERFACE_FONT_MAX; font++) {
         if (gInterfaceFontDescriptors[font].data != nullptr) {
             internal_free_safe(gInterfaceFontDescriptors[font].data, __FILE__, __LINE__); // FONTMGR.C, 124
@@ -142,6 +151,13 @@ int interfaceFontGetStringWidthScaled(const char* string, int color, float scale
     }
 
     return interfaceFontGetScaledWidthImpl(string, color, std::max(scale, 0.01f));
+}
+
+int interfaceFontSetCjkMinimumHeight(int height)
+{
+    int previousHeight = gCjkInterfaceFontMinimumHeight;
+    gCjkInterfaceFontMinimumHeight = std::clamp(height, 0, 64);
+    return previousHeight;
 }
 
 // 0x441D20 FMLoadFont
@@ -271,7 +287,7 @@ static int interfaceFontGetLineHeightImpl()
         return 0;
     }
 
-    return gCurrentInterfaceFontDescriptor->lineSpacing + gCurrentInterfaceFontDescriptor->maxHeight;
+    return gCurrentInterfaceFontDescriptor->lineSpacing + interfaceFontGetEffectiveMaxHeight();
 }
 
 // 0x442188 FMtext_width
@@ -380,7 +396,7 @@ static int interfaceFontGetMonospacedCharacterWidthImpl()
         spacing = gCurrentInterfaceFontDescriptor->letterSpacing;
     }
 
-    return spacing + gCurrentInterfaceFontDescriptor->maxHeight;
+    return spacing + interfaceFontGetEffectiveMaxHeight();
 }
 
 // 0x4422B4 FMtext_to_buf
@@ -434,16 +450,17 @@ static void interfaceFontDrawImpl(unsigned char* buf, const char* string, int le
                 interfaceFontDrawDbcsGlyph(ptr,
                     pitch,
                     color,
+                    palette,
                     glyphView,
                     characterWidth,
-                    gCurrentInterfaceFontDescriptor->maxHeight);
+                    interfaceFontGetEffectiveMaxHeight());
             }
         } else {
             InterfaceFontGlyph* glyph = &(gCurrentInterfaceFontDescriptor->glyphs[ch]);
             unsigned char* glyphDataPtr = gCurrentInterfaceFontDescriptor->data + glyph->offset;
 
             // Skip blank pixels (difference between font's line height and glyph height).
-            ptr += (gCurrentInterfaceFontDescriptor->maxHeight - glyph->height) * pitch;
+            ptr += (interfaceFontGetEffectiveMaxHeight() - glyph->height) * pitch;
 
             for (int y = 0; y < glyph->height; y++) {
                 for (int x = 0; x < glyph->width; x++) {
@@ -461,7 +478,7 @@ static void interfaceFontDrawImpl(unsigned char* buf, const char* string, int le
 
     if ((color & DRAW_TEXT_FLAG_UNDERLINED) != 0) {
         int length = ptr - buf;
-        unsigned char* underlinePtr = buf + pitch * (gCurrentInterfaceFontDescriptor->maxHeight - 1);
+        unsigned char* underlinePtr = buf + pitch * (interfaceFontGetEffectiveMaxHeight() - 1);
         for (int index = 0; index < length; index++) {
             *underlinePtr++ = color & 0xFF;
         }
@@ -501,11 +518,12 @@ static void interfaceFontDrawScaledImpl(const Buffer2D& dest, int x, int y, cons
             TextFontGlyphView glyphView;
             if (textFontGetDbcsGlyph(ch, &glyphView)) {
                 int scaledGlyphWidth = std::max(1, static_cast<int>(lround(characterWidth * scale)));
-                int scaledGlyphHeight = std::max(1, static_cast<int>(lround(gCurrentInterfaceFontDescriptor->maxHeight * scale)));
+                int scaledGlyphHeight = std::max(1, static_cast<int>(lround(interfaceFontGetEffectiveMaxHeight() * scale)));
                 interfaceFontDrawDbcsGlyphScaled2D(dest,
                     glyphX,
                     y,
                     color,
+                    palette,
                     glyphView,
                     scaledGlyphWidth,
                     scaledGlyphHeight);
@@ -514,9 +532,10 @@ static void interfaceFontDrawScaledImpl(const Buffer2D& dest, int x, int y, cons
             InterfaceFontGlyph* glyph = &(gCurrentInterfaceFontDescriptor->glyphs[ch]);
             if (glyph->width > 0 && glyph->height > 0) {
                 unsigned char* glyphData = gCurrentInterfaceFontDescriptor->data + glyph->offset;
+                int scaledEffectiveHeight = std::max(1, static_cast<int>(lround(interfaceFontGetEffectiveMaxHeight() * scale)));
                 int scaledGlyphWidth = std::max(1, static_cast<int>(lround(glyph->width * scale)));
                 int scaledGlyphHeight = std::max(1, static_cast<int>(lround(glyph->height * scale)));
-                int glyphY = y + std::max(0, static_cast<int>(lround((gCurrentInterfaceFontDescriptor->maxHeight - glyph->height) * scale)));
+                int glyphY = y + std::max(0, scaledEffectiveHeight - scaledGlyphHeight);
 
                 int destLeft = std::max(glyphX, 0);
                 int destTop = std::max(glyphY, 0);
@@ -575,22 +594,60 @@ static int interfaceFontDecodeCharacterImpl(const char* string, int* length)
     return textFontDecodeDbcsCharacter(string, length);
 }
 
+static int interfaceFontGetEffectiveMaxHeight()
+{
+    int height = gCurrentInterfaceFontDescriptor->maxHeight;
+
+    if (gCjkInterfaceFontMinimumHeight > 0
+        && gCurrentInterfaceFont == 1
+        && textFontHasDbcsGlyphs()
+        && compat_stricmp(settings.system.language.c_str(), "chs") == 0) {
+        height = std::max(height, gCjkInterfaceFontMinimumHeight);
+    }
+
+    return height;
+}
+
 static int interfaceFontGetDbcsGlyphWidth(const TextFontGlyphView& glyphView)
 {
     if (glyphView.width <= 0 || glyphView.height <= 0) {
         return 0;
     }
 
-    return std::max(1, (glyphView.width * gCurrentInterfaceFontDescriptor->maxHeight + glyphView.height / 2) / glyphView.height);
+    return std::max(1, (glyphView.width * interfaceFontGetEffectiveMaxHeight() + glyphView.height / 2) / glyphView.height);
 }
 
-static void interfaceFontDrawDbcsGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
+static void interfaceFontDrawDbcsGlyph(unsigned char* buf, int pitch, int color, unsigned char* palette, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
 {
     if (glyphView.data == nullptr
         || glyphView.width <= 0
         || glyphView.height <= 0
         || targetWidth <= 0
         || targetHeight <= 0) {
+        return;
+    }
+
+    MonochromeGlyphCoverageView coverageView;
+    if (palette != nullptr
+        && monochromeFontGetDownscaledGlyphCoverage(glyphView.data,
+            glyphView.width,
+            glyphView.height,
+            glyphView.rowBytes,
+            targetWidth,
+            targetHeight,
+            &coverageView)) {
+        for (int y = 0; y < targetHeight; y++) {
+            unsigned char* destination = buf + y * pitch;
+            const unsigned char* coverage = coverageView.coverage + y * targetWidth;
+            for (int x = 0; x < targetWidth; x++) {
+                unsigned char level = coverage[x];
+                if (level == 7) {
+                    destination[x] = color & 0xFF;
+                } else if (level != 0) {
+                    destination[x] = palette[(level << 8) + destination[x]];
+                }
+            }
+        }
         return;
     }
 
@@ -608,7 +665,7 @@ static void interfaceFontDrawDbcsGlyph(unsigned char* buf, int pitch, int color,
     }
 }
 
-static void interfaceFontDrawDbcsGlyphScaled2D(const Buffer2D& dest, int x, int y, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
+static void interfaceFontDrawDbcsGlyphScaled2D(const Buffer2D& dest, int x, int y, int color, unsigned char* palette, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
 {
     if (dest.data == nullptr
         || glyphView.data == nullptr
@@ -619,12 +676,36 @@ static void interfaceFontDrawDbcsGlyphScaled2D(const Buffer2D& dest, int x, int 
         return;
     }
 
+    MonochromeGlyphCoverageView coverageView;
+    bool hasCoverage = palette != nullptr
+        && monochromeFontGetDownscaledGlyphCoverage(glyphView.data,
+            glyphView.width,
+            glyphView.height,
+            glyphView.rowBytes,
+            targetWidth,
+            targetHeight,
+            &coverageView);
+
     int destinationLeft = std::max(x, 0);
     int destinationTop = std::max(y, 0);
     int destinationRight = std::min(x + targetWidth, dest.width);
     int destinationBottom = std::min(y + targetHeight, dest.height);
 
     for (int destinationY = destinationTop; destinationY < destinationBottom; destinationY++) {
+        if (hasCoverage) {
+            const unsigned char* coverage = coverageView.coverage + (destinationY - y) * targetWidth;
+            for (int destinationX = destinationLeft; destinationX < destinationRight; destinationX++) {
+                unsigned char level = coverage[destinationX - x];
+                unsigned char* pixel = dest.data + destinationY * dest.width + destinationX;
+                if (level == 7) {
+                    *pixel = color & 0xFF;
+                } else if (level != 0) {
+                    *pixel = palette[(level << 8) + *pixel];
+                }
+            }
+            continue;
+        }
+
         int sourceY = (destinationY - y) * glyphView.height / targetHeight;
         const unsigned char* sourceRow = glyphView.data + sourceY * glyphView.rowBytes;
 

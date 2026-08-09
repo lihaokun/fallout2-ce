@@ -179,6 +179,8 @@ set(FALLOUT_ENGINE_SOURCES
     "src/movie_lib.h"
     "src/movie.cc"
     "src/movie.h"
+    "src/monochrome_font_scaler.cc"
+    "src/monochrome_font_scaler.h"
     "src/nevs.cc"
     "src/nevs.h"
     "src/obj_types.h"

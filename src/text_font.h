@@ -60,6 +60,7 @@ void textFontsExit();
 int textFontLoad(int font);
 int textFontDecodeDbcsCharacter(const char* string, int* length);
 bool textFontGetDbcsGlyph(int ch, TextFontGlyphView* glyphView);
+bool textFontHasDbcsGlyphs();
 int fontManagerAdd(FontManager* fontManager);
 int fontGetCurrent();
 void fontSetCurrent(int font);

@@ -7,6 +7,7 @@
 #include "color.h"
 #include "db.h"
 #include "memory.h"
+#include "monochrome_font_scaler.h"
 #include "platform_compat.h"
 #include "settings.h"
 #include "window_manager.h"
@@ -60,7 +61,7 @@ static bool textFontUsesDbcs();
 static bool textFontGetGlyphView(const TextFontDescriptor* fontDescriptor, int ch, TextFontGlyphView* glyphView);
 static bool textFontGetCurrentGlyphView(int ch, TextFontGlyphView* glyphView);
 static int textFontGetScaledGlyphWidth(const TextFontGlyphView& glyphView);
-static void textFontDrawGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
+static void textFontDrawGlyph(unsigned char* buf, int pitch, int color, unsigned char* palette, bool isDbcs, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight);
 
 // 0x4D5530 GNW_text_functions
 FontManager gTextFontManager = {
@@ -153,6 +154,8 @@ int textFontsInit()
 // 0x4D55CC GNW_text_exit
 void textFontsExit()
 {
+    monochromeFontScalerClearCache();
+
     for (int index = 0; index < TEXT_FONT_MAX; index++) {
         TextFontDescriptor* textFontDescriptor = &(gTextFontDescriptors[index]);
         if (textFontDescriptor->glyphCount != 0) {
@@ -389,6 +392,18 @@ bool textFontGetDbcsGlyph(int ch, TextFontGlyphView* glyphView)
     return false;
 }
 
+bool textFontHasDbcsGlyphs()
+{
+    for (int font = 0; font < TEXT_FONT_MAX; font++) {
+        TextFontDescriptor* fontDescriptor = &(gTextFontDescriptors[font]);
+        if (fontDescriptor->data != nullptr && fontDescriptor->glyphCount > 256) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // 0x4D5780 text_add_manager
 int fontManagerAdd(FontManager* fontManager)
 {
@@ -525,13 +540,38 @@ static int textFontGetScaledGlyphWidth(const TextFontGlyphView& glyphView)
     return std::max(1, (glyphView.width * gCurrentTextFontDescriptor->lineHeight + glyphView.height / 2) / glyphView.height);
 }
 
-static void textFontDrawGlyph(unsigned char* buf, int pitch, int color, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
+static void textFontDrawGlyph(unsigned char* buf, int pitch, int color, unsigned char* palette, bool isDbcs, const TextFontGlyphView& glyphView, int targetWidth, int targetHeight)
 {
     if (glyphView.data == nullptr
         || glyphView.width <= 0
         || glyphView.height <= 0
         || targetWidth <= 0
         || targetHeight <= 0) {
+        return;
+    }
+
+    MonochromeGlyphCoverageView coverageView;
+    if (isDbcs
+        && palette != nullptr
+        && monochromeFontGetDownscaledGlyphCoverage(glyphView.data,
+            glyphView.width,
+            glyphView.height,
+            glyphView.rowBytes,
+            targetWidth,
+            targetHeight,
+            &coverageView)) {
+        for (int y = 0; y < targetHeight; y++) {
+            unsigned char* destination = buf + y * pitch;
+            const unsigned char* coverage = coverageView.coverage + y * targetWidth;
+            for (int x = 0; x < targetWidth; x++) {
+                unsigned char level = coverage[x];
+                if (level == 7) {
+                    destination[x] = color & 0xFF;
+                } else if (level != 0) {
+                    destination[x] = palette[(level << 8) + destination[x]];
+                }
+            }
+        }
         return;
     }
 
@@ -556,6 +596,8 @@ static void textFontDrawImpl(unsigned char* buf, const char* string, int length,
         color &= ~DRAW_TEXT_FLAG_SHADOWED;
         fontDrawText(buf + pitch + 1, string, length, pitch, COLOR_BLACK);
     }
+
+    unsigned char* palette = nullptr;
 
     int monospacedCharacterWidth;
     if ((color & DRAW_TEXT_FLAG_MONOSPACED) != 0) {
@@ -589,9 +631,18 @@ static void textFontDrawImpl(unsigned char* buf, const char* string, int length,
             break;
         }
 
+        bool isDbcs = ch > 0xFF;
+        if (isDbcs
+            && palette == nullptr
+            && (characterWidth < glyphView.width || gCurrentTextFontDescriptor->lineHeight < glyphView.height)) {
+            palette = _getColorBlendTable(color & 0xFF);
+        }
+
         textFontDrawGlyph(ptr,
             pitch,
             color,
+            palette,
+            isDbcs,
             glyphView,
             characterWidth,
             gCurrentTextFontDescriptor->lineHeight);
@@ -606,6 +657,10 @@ static void textFontDrawImpl(unsigned char* buf, const char* string, int length,
         for (int pix = 0; pix < length; pix++) {
             *underlinePtr++ = color & 0xFF;
         }
+    }
+
+    if (palette != nullptr) {
+        _freeColorBlendTable(color & 0xFF);
     }
 }
 

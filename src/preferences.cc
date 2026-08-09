@@ -9,6 +9,7 @@
 #include "debug.h"
 #include "delay.h"
 #include "draw.h"
+#include "font_manager.h"
 #include "game.h"
 #include "game_mouse.h"
 #include "game_sound.h"
@@ -565,6 +566,8 @@ static void _JustUpdate_()
 // 0x491A68 UpdateThing
 static void _UpdateThing(int index)
 {
+    ScopedCjkInterfaceFontHeight cjkFontHeight(11);
+
     fontSetCurrent(101);
 
     PreferenceDescription* meta = &(gPreferenceDescriptions[index]);
@@ -971,6 +974,8 @@ void brightnessDecrease()
 // 0x4908A0 PrefStart
 static int preferencesWindowInit()
 {
+    ScopedCjkInterfaceFontHeight cjkFontHeight(11);
+
     int i;
     int fid;
     char* messageItemText;
@@ -1302,6 +1307,9 @@ int doPreferences(bool animated)
 // 0x490E8C DoThing
 static void _DoThing(int eventCode)
 {
+    ScopedCjkInterfaceFontHeight cjkFontHeight(11);
+    fontSetCurrent(101);
+
     int x;
     int y;
     mouseGetPositionInWindow(gPreferencesWindow, &x, &y);

@@ -14,6 +14,27 @@ void interfaceFontsExit();
 void interfaceFontDrawTextScaled2D(const Buffer2D& dest, int x, int y, const char* string, int color, float scale);
 int interfaceFontGetStringWidthScaled(const char* string, int color, float scale);
 
+int interfaceFontSetCjkMinimumHeight(int height);
+
+class ScopedCjkInterfaceFontHeight {
+public:
+    explicit ScopedCjkInterfaceFontHeight(int height)
+        : _previousHeight(interfaceFontSetCjkMinimumHeight(height))
+    {
+    }
+
+    ~ScopedCjkInterfaceFontHeight()
+    {
+        interfaceFontSetCjkMinimumHeight(_previousHeight);
+    }
+
+    ScopedCjkInterfaceFontHeight(const ScopedCjkInterfaceFontHeight&) = delete;
+    ScopedCjkInterfaceFontHeight& operator=(const ScopedCjkInterfaceFontHeight&) = delete;
+
+private:
+    int _previousHeight;
+};
+
 } // namespace fallout
 
 #endif /* FONT_MANAGER_H */

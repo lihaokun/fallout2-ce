@@ -10,6 +10,7 @@
 #include "color.h"
 #include "combat.h"
 #include "draw.h"
+#include "font_manager.h"
 #include "game_mouse.h"
 #include "game_sound.h"
 #include "geometry.h"
@@ -104,6 +105,8 @@ static int gConsoleFilePrintCount = 0;
 int displayMonitorInit()
 {
     if (!gDisplayMonitorInitialized) {
+        ScopedCjkInterfaceFontHeight cjkFontHeight(11);
+
         gDisplayMonitorRect = {
             DISPLAY_MONITOR_X,
             DISPLAY_MONITOR_Y,
@@ -241,6 +244,8 @@ void displayMonitorAddMessage(const char* str)
     // SFALL
     consoleFileAddMessage(str);
 
+    ScopedCjkInterfaceFontHeight cjkFontHeight(11);
+
     int oldFont = fontGetCurrent();
     fontSetCurrent(DISPLAY_MONITOR_FONT);
 
@@ -366,6 +371,8 @@ static void displayMonitorRefresh()
     if (buf == nullptr) {
         return;
     }
+
+    ScopedCjkInterfaceFontHeight cjkFontHeight(11);
 
     buf += _intface_full_width * DISPLAY_MONITOR_Y + DISPLAY_MONITOR_X;
     blitBufferToBuffer(gDisplayMonitorBackgroundFrmData,
